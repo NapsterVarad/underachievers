@@ -14,6 +14,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/underachievers/delta-altcoin-scalper/dashboard/backend"
 	"github.com/underachievers/delta-altcoin-scalper/internal/config"
 	"github.com/underachievers/delta-altcoin-scalper/internal/delta"
 	"github.com/underachievers/delta-altcoin-scalper/internal/execution"
@@ -23,71 +24,94 @@ import (
 	"github.com/underachievers/delta-altcoin-scalper/internal/scanner"
 	sigeng "github.com/underachievers/delta-altcoin-scalper/internal/signal"
 	"github.com/underachievers/delta-altcoin-scalper/internal/state"
+	"github.com/underachievers/delta-altcoin-scalper/internal/telegram"
 )
 
 // ---------------------------------------------------------------------------
 // Adapter: delta.DeltaClient -> scanner.DeltaClient
 // ---------------------------------------------------------------------------
 
-type scannerDeltaAdapter struct {
+type ScannerDeltaClient struct {
 	client *delta.DeltaClient
 }
 
-func (a *scannerDeltaAdapter) GetAllContracts(ctx context.Context) ([]models.Symbol, error) {
+func (a *ScannerDeltaClient) GetContracts() ([]models.Symbol, error) {
 	return a.client.GetContracts()
 }
 
-func (a *scannerDeltaAdapter) GetCandles(ctx context.Context, symbol, interval string, limit int) ([]models.Candle, error) {
+func (a *ScannerDeltaClient) GetTicker(symbol string) (*models.Symbol, error) {
+	ticker, err := a.client.GetTicker(symbol)
+	if err != nil {
+		return nil, err
+	}
+	return &models.Symbol{
+		Name:           symbol,
+		LastPrice:      ticker.LastPrice,
+		Volume24h:      ticker.Volume24h,
+		Volume24hUSD:   ticker.Volume24hUSD,
+		OpenInterest:   ticker.OpenInterest,
+		FundingRate:    ticker.FundingRate,
+		MarkPrice:      ticker.MarkPrice,
+		IndexPrice:     ticker.IndexPrice,
+		PriceChange24h: ticker.PriceChange24h,
+	}, nil
+}
+
+func (a *ScannerDeltaClient) GetCandles(symbol, interval string, limit int) ([]models.Candle, error) {
 	return a.client.GetCandles(symbol, interval, limit)
 }
 
-func (a *scannerDeltaAdapter) GetOpenInterest(ctx context.Context, symbol string) (decimal.Decimal, error) {
-	ticker, err := a.client.GetTicker(symbol)
-	if err != nil {
-		return decimal.Zero, err
-	}
-	return ticker.OpenInterest, nil
+func (a *ScannerDeltaClient) GetOrderBook(symbol string, depth int) (*models.OrderBook, error) {
+	return a.client.GetOrderBook(symbol, depth)
 }
 
 // ---------------------------------------------------------------------------
 // Adapter: indicators package functions -> scanner.IndicatorCalculator
 // ---------------------------------------------------------------------------
 
-type indicatorCalcAdapter struct{}
+type IndicatorCalculator struct{}
 
-func (a *indicatorCalcAdapter) CalculateRSI(closes []decimal.Decimal, period int) decimal.Decimal {
-	return indicators.RSI(closes, period)
-}
-
-func (a *indicatorCalcAdapter) CalculateATR(candles []models.Candle, period int) decimal.Decimal {
+func (a *IndicatorCalculator) ATR(candles []models.Candle, period int) decimal.Decimal {
 	return indicators.ATR(candles, period)
 }
 
-func (a *indicatorCalcAdapter) CalculateEMA(values []decimal.Decimal, period int) decimal.Decimal {
-	return indicators.EMA(values, period)
+func (a *IndicatorCalculator) RSI(closes []decimal.Decimal, period int) decimal.Decimal {
+	return indicators.RSI(closes, period)
 }
 
-func (a *indicatorCalcAdapter) CalculateMACD(closes []decimal.Decimal, fastPeriod, slowPeriod, signalPeriod int) (decimal.Decimal, decimal.Decimal, decimal.Decimal) {
-	return indicators.MACD(closes, fastPeriod, slowPeriod, signalPeriod)
+func (a *IndicatorCalculator) EMA(closes []decimal.Decimal, period int) decimal.Decimal {
+	return indicators.EMA(closes, period)
 }
 
-func (a *indicatorCalcAdapter) CalculateROC(closes []decimal.Decimal, period int) decimal.Decimal {
-	return indicators.RateOfChange(closes, period)
+func (a *IndicatorCalculator) VolumeAverage(volumes []decimal.Decimal, period int) decimal.Decimal {
+	return indicators.VolumeAverage(volumes, period)
+}
+
+func (a *IndicatorCalculator) RateOfChange(closes []decimal.Decimal, lookback int) decimal.Decimal {
+	return indicators.RateOfChange(closes, lookback)
 }
 
 // ---------------------------------------------------------------------------
 // Adapter: delta.DeltaClient -> signal.DeltaClient
 // ---------------------------------------------------------------------------
 
-type signalDeltaAdapter struct {
+type SignalDeltaClient struct {
 	client *delta.DeltaClient
 }
 
-func (a *signalDeltaAdapter) GetKlines(symbol, interval string, limit int) ([]models.Candle, error) {
+func (a *SignalDeltaClient) GetCandles(symbol, interval string, limit int) ([]models.Candle, error) {
 	return a.client.GetCandles(symbol, interval, limit)
 }
 
-func (a *signalDeltaAdapter) GetOpenInterest(symbol string) (decimal.Decimal, error) {
+func (a *SignalDeltaClient) GetOrderBook(symbol string, depth int) (*models.OrderBook, error) {
+	return a.client.GetOrderBook(symbol, depth)
+}
+
+func (a *SignalDeltaClient) GetFundingRate(symbol string) (decimal.Decimal, error) {
+	return a.client.GetFundingRate(symbol)
+}
+
+func (a *SignalDeltaClient) GetOpenInterest(symbol string) (decimal.Decimal, error) {
 	ticker, err := a.client.GetTicker(symbol)
 	if err != nil {
 		return decimal.Zero, err
@@ -95,43 +119,68 @@ func (a *signalDeltaAdapter) GetOpenInterest(symbol string) (decimal.Decimal, er
 	return ticker.OpenInterest, nil
 }
 
-func (a *signalDeltaAdapter) GetOpenInterestHistory(symbol string, limit int) ([]decimal.Decimal, error) {
-	result := make([]decimal.Decimal, 0, limit)
-	for i := 0; i < limit; i++ {
-		result = append(result, decimal.Zero)
-	}
-	return result, nil
+// ---------------------------------------------------------------------------
+// Adapter: scanner.CoinScanner -> signal.Scanner
+// ---------------------------------------------------------------------------
+
+type ScannerAdapter struct {
+	inner *scanner.CoinScanner
 }
 
-func (a *signalDeltaAdapter) GetFundingRate(symbol string) (decimal.Decimal, error) {
-	info, err := a.client.GetFundingRate(symbol)
-	if err != nil {
-		return decimal.Zero, err
+func (a *ScannerAdapter) GetResults() []sigeng.ScannerResult {
+	inner := a.inner.GetResults()
+	results := make([]sigeng.ScannerResult, len(inner))
+	for i, r := range inner {
+		results[i] = sigeng.ScannerResult{
+			Symbol: r.Symbol,
+			Score:  int(r.Score.IntPart()),
+		}
 	}
-	return info.FundingRate, nil
-}
-
-func (a *signalDeltaAdapter) GetSymbol(symbol string) (*models.Symbol, error) {
-	return a.client.GetTicker(symbol)
+	return results
 }
 
 // ---------------------------------------------------------------------------
 // Adapter: delta.DeltaClient -> execution.ExchangeClient
 // ---------------------------------------------------------------------------
 
-type exchangeAdapter struct {
-	client *delta.DeltaClient
+type ExecutionExchange struct {
+	client   *delta.DeltaClient
+	paper    *execution.PaperTradingClient
+	isPaper  bool
+	mu       sync.Mutex
+	orderSeq int
 }
 
-func (a *exchangeAdapter) PlaceOrder(symbol string, side models.OrderSide, orderType models.OrderType, quantity, price, stopPrice decimal.Decimal) (*models.Order, error) {
-	return a.client.PlaceOrder(symbol, string(side), string(orderType), quantity, price)
+func (a *ExecutionExchange) PlaceOrder(symbol, side, orderType string, quantity, price, stopPrice decimal.Decimal) (string, error) {
+	if a.isPaper && a.paper != nil {
+		return a.paper.PlaceOrder(symbol, side, orderType, quantity, price, stopPrice)
+	}
+	a.mu.Lock()
+	a.orderSeq++
+	id := fmt.Sprintf("live-%s-%d", symbol, a.orderSeq)
+	a.mu.Unlock()
+
+	order, err := a.client.PlaceOrder(symbol, side, orderType, quantity, price, stopPrice)
+	if err != nil {
+		return "", err
+	}
+	if order != nil && order.ID != "" {
+		return order.ID, nil
+	}
+	return id, nil
 }
 
-func (a *exchangeAdapter) CancelOrder(orderID string) error {
+func (a *ExecutionExchange) CancelOrder(orderID string) error {
+	if a.isPaper && a.paper != nil {
+		return a.paper.CancelOrder(orderID)
+	}
 	return a.client.CancelOrder(orderID)
 }
 
-func (a *exchangeAdapter) GetOrder(orderID string) (*models.Order, error) {
+func (a *ExecutionExchange) GetOrder(orderID string) (*models.Order, error) {
+	if a.isPaper && a.paper != nil {
+		return a.paper.GetOrder(orderID)
+	}
 	orders, err := a.client.GetOpenOrders()
 	if err != nil {
 		return nil, err
@@ -144,200 +193,130 @@ func (a *exchangeAdapter) GetOrder(orderID string) (*models.Order, error) {
 	return nil, fmt.Errorf("order %s not found", orderID)
 }
 
-func (a *exchangeAdapter) GetMarkPrice(symbol string) (decimal.Decimal, error) {
+func (a *ExecutionExchange) GetMarkPrice(symbol string) (decimal.Decimal, error) {
+	if a.isPaper && a.paper != nil {
+		return a.paper.GetMarkPrice(symbol)
+	}
 	ticker, err := a.client.GetTicker(symbol)
 	if err != nil {
 		return decimal.Zero, err
 	}
-	return ticker.MarkPrice, nil
+	if !ticker.MarkPrice.IsZero() {
+		return ticker.MarkPrice, nil
+	}
+	return ticker.LastPrice, nil
 }
 
-func (a *exchangeAdapter) GetAccountBalance() (decimal.Decimal, error) {
-	balances, err := a.client.GetBalance()
+func (a *ExecutionExchange) GetAccountBalance() (decimal.Decimal, error) {
+	if a.isPaper && a.paper != nil {
+		return a.paper.GetAccountBalance()
+	}
+	return a.client.GetBalance()
+}
+
+func (a *ExecutionExchange) GetOpenPositions() ([]*models.Position, error) {
+	if a.isPaper && a.paper != nil {
+		return a.paper.GetOpenPositions()
+	}
+	positions, err := a.client.GetPositions()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*models.Position, len(positions))
+	for i := range positions {
+		result[i] = &positions[i]
+	}
+	return result, nil
+}
+
+func (a *ExecutionExchange) ClosePosition(symbol string, quantity decimal.Decimal) (decimal.Decimal, error) {
+	if a.isPaper && a.paper != nil {
+		return a.paper.ClosePosition(symbol, quantity)
+	}
+	positions, err := a.client.GetPositions()
 	if err != nil {
 		return decimal.Zero, err
 	}
-	if len(balances) > 0 {
-		return balances[0].LastPrice, nil
-	}
-	return decimal.Zero, fmt.Errorf("no balance found")
-}
-
-func (a *exchangeAdapter) GetOpenPositions() ([]models.Position, error) {
-	return a.client.GetPositions()
-}
-
-func (a *exchangeAdapter) ClosePosition(symbol string, quantity decimal.Decimal) (decimal.Decimal, error) {
-	ticker, err := a.client.GetTicker(symbol)
-	if err != nil {
-		return decimal.Zero, err
-	}
-	side := models.OrderSideSell
-	pos, err := a.client.GetPositions()
-	if err == nil && len(pos) > 0 {
-		for _, p := range pos {
-			if p.Symbol == symbol && p.Side == models.OrderSideSell {
-				side = models.OrderSideBuy
-				break
+	side := string(models.OrderSideSell)
+	for _, p := range positions {
+		if p.Symbol == symbol {
+			if p.Side == models.OrderSideSell {
+				side = string(models.OrderSideBuy)
 			}
+			break
 		}
 	}
-	order, err := a.client.PlaceOrder(symbol, string(side), "market", quantity, ticker.MarkPrice)
+	order, err := a.client.PlaceOrder(symbol, side, string(models.OrderTypeMarket), quantity, decimal.Zero, decimal.Zero)
 	if err != nil {
 		return decimal.Zero, err
 	}
-	return order.AvgFillPrice, nil
+	if order != nil && !order.AvgFillPrice.IsZero() {
+		return order.AvgFillPrice, nil
+	}
+	ticker, err := a.client.GetTicker(symbol)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	return ticker.LastPrice, nil
 }
 
 // ---------------------------------------------------------------------------
 // Adapter: risk.Manager -> execution.RiskManager
 // ---------------------------------------------------------------------------
 
-type riskManagerAdapter struct {
-	mgr      *risk.Manager
-	stateMgr *state.Manager
+type RiskManagerAdapter struct {
+	mgr *risk.Manager
 }
 
-func (a *riskManagerAdapter) CalculatePositionSize(sig models.Signal, balance decimal.Decimal, leverage int) (decimal.Decimal, error) {
-	sizing, err := a.mgr.CalculatePositionSize(sig.EntryPrice, sig.Indicators.ATR, balance)
-	if err != nil {
-		return decimal.Zero, err
-	}
-	return sizing.PositionSize, nil
+func (a *RiskManagerAdapter) CalculatePositionSize(capital, entryPrice decimal.Decimal) decimal.Decimal {
+	qty, _ := a.mgr.CalculatePositionSize(entryPrice, decimal.NewFromFloat(1.0))
+	return qty
 }
 
-func (a *riskManagerAdapter) CheckPreFlight(sig models.Signal, balance decimal.Decimal, openPositions int, dailyPnL decimal.Decimal) error {
-	canOpen, reason := a.mgr.CanOpenPosition()
-	if !canOpen {
-		return fmt.Errorf("cannot open position: %s", reason)
-	}
-	return nil
+func (a *RiskManagerAdapter) CalculateStopLoss(entryPrice decimal.Decimal, side models.OrderSide, atr decimal.Decimal) decimal.Decimal {
+	return a.mgr.CalculateStopLoss(entryPrice, atr, side)
 }
 
-func (a *riskManagerAdapter) CalculateStopLoss(entryPrice decimal.Decimal, atr decimal.Decimal) decimal.Decimal {
-	return a.mgr.CalculateStopLoss(entryPrice, atr, models.OrderSideBuy)
+func (a *RiskManagerAdapter) CalculateTakeProfit(entryPrice decimal.Decimal, side models.OrderSide, atr decimal.Decimal, level int) decimal.Decimal {
+	return a.mgr.CalculateTakeProfit(entryPrice, atr, side, level)
 }
 
-func (a *riskManagerAdapter) CalculateTakeProfit(entryPrice decimal.Decimal, atr decimal.Decimal, multiplier float64) decimal.Decimal {
-	dist := atr.Mul(decimal.NewFromFloat(multiplier))
-	return entryPrice.Add(dist)
-}
-
-func (a *riskManagerAdapter) DetermineLeverage(sig models.Signal) int {
-	return 5
+func (a *RiskManagerAdapter) CanEnterTrade(symbol string, capital decimal.Decimal, tradeCount int) bool {
+	return a.mgr.CanEnterTrade() == nil
 }
 
 // ---------------------------------------------------------------------------
 // Adapter: state.Manager -> execution.TradeRecorder
 // ---------------------------------------------------------------------------
 
-type tradeRecorderAdapter struct {
+type StateRecorderAdapter struct {
 	mgr *state.Manager
 }
 
-func (a *tradeRecorderAdapter) RecordTrade(trade models.Trade) error {
-	a.mgr.RecordTrade(trade)
+func (a *StateRecorderAdapter) RecordTrade(trade *models.Trade) error {
+	a.mgr.RecordTrade(*trade)
 	return nil
 }
 
-func (a *tradeRecorderAdapter) UpdateDailyStats(stats models.DailyStats) error {
+func (a *StateRecorderAdapter) UpdateCapital(capital decimal.Decimal) error {
+	current := a.mgr.GetCurrentCapital()
+	pnl := capital.Sub(current)
+	a.mgr.UpdateCapital(pnl)
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// Signal channel adapter: *models.Signal -> models.Signal
-// ---------------------------------------------------------------------------
-
-func signalAdapterLoop(ctx context.Context, in <-chan *models.Signal, out chan models.Signal) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case sig, ok := <-in:
-			if !ok {
-				close(out)
-				return
-			}
-			if sig != nil {
-				select {
-				case out <- *sig:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}
+func (a *StateRecorderAdapter) AddPosition(pos *models.Position) error {
+	a.mgr.AddPosition(pos.Symbol)
+	return nil
 }
 
-// ---------------------------------------------------------------------------
-// DashboardServer - serves live data from all components
-// ---------------------------------------------------------------------------
-
-type DashboardServer struct {
-	stateMgr   *state.Manager
-	scanner    *scanner.CoinScanner
-	sigEngine  *sigeng.Engine
-	riskMgr    *risk.Manager
-	execEngine *execution.Engine
+func (a *StateRecorderAdapter) RemovePosition(symbol string) error {
+	a.mgr.RemovePosition(symbol)
+	return nil
 }
 
-func NewDashboardServer(
-	stateMgr *state.Manager,
-	scanner *scanner.CoinScanner,
-	sigEngine *sigeng.Engine,
-	riskMgr *risk.Manager,
-	execEngine *execution.Engine,
-) *DashboardServer {
-	return &DashboardServer{
-		stateMgr:   stateMgr,
-		scanner:    scanner,
-		sigEngine:  sigEngine,
-		riskMgr:    riskMgr,
-		execEngine: execEngine,
-	}
-}
-
-func (d *DashboardServer) Start(addr string) error {
-	http.HandleFunc("/api/status", d.handleStatus)
-	http.HandleFunc("/api/positions", d.handlePositions)
-	http.HandleFunc("/api/scanner", d.handleScanner)
-	http.HandleFunc("/api/daily", d.handleDaily)
-	log.Printf("[Dashboard] serving on %s", addr)
-	return http.ListenAndServe(addr, nil)
-}
-
-func (d *DashboardServer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"running":true,"capital":"%s"}`, d.stateMgr.GetCurrentCapital().String())
-}
-
-func (d *DashboardServer) handlePositions(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	positions := d.stateMgr.GetOpenPositions()
-	fmt.Fprintf(w, `{"positions":%d,"symbols":["%s"]}`, len(positions), joinStrings(positions))
-}
-
-func (d *DashboardServer) handleScanner(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	results := d.scanner.GetResults()
-	fmt.Fprintf(w, `{"results":%d}`, len(results))
-}
-
-func (d *DashboardServer) handleDaily(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	stats := d.stateMgr.GetDailyStats()
-	fmt.Fprintf(w, `{"pnl":"%s","trades":%d}`, stats.PnL.String(), stats.TradesCount)
-}
-
-func joinStrings(s []string) string {
-	result := ""
-	for i, v := range s {
-		if i > 0 {
-			result += ","
-		}
-		result += v
-	}
-	return result
+func (a *StateRecorderAdapter) GetTodayTradeCount() int {
+	return a.mgr.GetTodayTradeCount()
 }
 
 // ---------------------------------------------------------------------------
@@ -345,15 +324,21 @@ func joinStrings(s []string) string {
 // ---------------------------------------------------------------------------
 
 func main() {
-	configPath := flag.String("config", "", "path to config file (optional)")
+	configPath := flag.String("config", "", "path to config file")
+	paperTrading := flag.Bool("paper", true, "enable paper trading mode")
 	flag.Parse()
 
-	log.Println("[main] Delta Exchange Altcoin Futures Scalping Bot starting")
+	log.Println("[main] Delta Exchange Altcoin Futures Scalping System starting")
 
-	settings := config.DefaultSettings()
+	cfg := config.LoadEnv()
 
 	if *configPath != "" {
-		log.Printf("[main] config file override not yet implemented, using defaults: %s", *configPath)
+		log.Printf("[main] config file specified: %s (env vars take precedence)", *configPath)
+	}
+
+	paperMode := *paperTrading
+	if paperMode {
+		log.Println("[main] paper trading mode enabled")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -370,29 +355,55 @@ func main() {
 
 	log.Println("[main] initializing components")
 
-	deltaClient := delta.NewClient(settings)
+	stateMgr := state.NewManager(&cfg)
 
-	stateMgr := state.NewManager(settings)
+	deltaClient := delta.NewClient(&cfg)
 
-	scannerAdapter := &scannerDeltaAdapter{client: deltaClient}
-	indicatorAdapter := &indicatorCalcAdapter{}
-	coinScanner := scanner.NewCoinScanner(scannerAdapter, indicatorAdapter, settings)
+	if err := deltaClient.Connect(); err != nil {
+		log.Printf("[main] warning: websocket connection failed: %v", err)
+	}
+	defer deltaClient.Disconnect()
 
-	signalAdapter := &signalDeltaAdapter{client: deltaClient}
-	sigEngine := sigeng.NewEngine(settings, signalAdapter, (*scanner.Scanner)(coinScanner))
+	scannerClient := &ScannerDeltaClient{client: deltaClient}
+	indicatorCalc := &IndicatorCalculator{}
+	coinScanner := scanner.NewCoinScanner(scannerClient, indicatorCalc, &cfg)
 
-	riskMgr := risk.NewManager(settings, decimal.NewFromFloat(settings.Risk.InitialCapital))
-	riskAdapter := &riskManagerAdapter{mgr: riskMgr, stateMgr: stateMgr}
+	signalClient := &SignalDeltaClient{client: deltaClient}
+	scannerAdapter := &ScannerAdapter{inner: coinScanner}
+	sigEngine := sigeng.NewEngine(signalClient, scannerAdapter, &cfg)
 
-	tradeRecorder := &tradeRecorderAdapter{mgr: stateMgr}
+	riskMgr := risk.NewManager(stateMgr, &cfg)
+	riskAdapter := &RiskManagerAdapter{mgr: riskMgr}
+	stateAdapter := &StateRecorderAdapter{mgr: stateMgr}
 
-	signalOut := make(chan models.Signal, 64)
-	go signalAdapterLoop(ctx, sigEngine.SignalChannel(), signalOut)
+	var exchangeClient execution.ExchangeClient
+	var paperClient *execution.PaperTradingClient
 
-	exchangeAdapter := &exchangeAdapter{client: deltaClient}
-	execEngine := execution.NewEngine(settings, exchangeAdapter, riskAdapter, tradeRecorder, signalOut)
+	if paperMode {
+		paperClient = execution.NewPaperTradingClient(&cfg)
+		exchangeClient = &ExecutionExchange{
+			client:  deltaClient,
+			paper:   paperClient,
+			isPaper: true,
+		}
+	} else {
+		exchangeClient = &ExecutionExchange{
+			client:  deltaClient,
+			paper:   nil,
+			isPaper: false,
+		}
+	}
 
-	dashboard := NewDashboardServer(stateMgr, coinScanner, sigEngine, riskMgr, execEngine)
+	signalCh := sigEngine.SignalsChannel()
+	execEngine := execution.NewEngine(exchangeClient, riskAdapter, stateAdapter, signalCh, &cfg)
+
+	alerter := telegram.NewAlerter(
+		cfg.Alert.TelegramToken,
+		cfg.Alert.TelegramChatID,
+		cfg.Alert.TelegramEnabled,
+	)
+
+	dashboardServer := backend.NewServer(stateMgr, nil, nil, nil, nil, nil, nil)
 
 	var wg sync.WaitGroup
 
@@ -405,21 +416,31 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sigEngine.Run(ctx)
+		sigEngine.Run()
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := execEngine.Start(ctx); err != nil {
-			log.Printf("[main] execution engine error: %v", err)
-		}
+		execEngine.Run()
 	}()
+
+	if cfg.Alert.TelegramEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			alerter.Start()
+		}()
+	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := dashboard.Start(":8080"); err != nil && err != http.ErrServerClosed {
+		fs := http.FileServer(http.Dir("dashboard/static"))
+		http.Handle("/", fs)
+		http.Handle("/api/", dashboardServer)
+		log.Printf("[main] dashboard serving static files and API on :8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil && err != http.ErrServerClosed {
 			log.Printf("[main] dashboard error: %v", err)
 		}
 	}()
@@ -430,9 +451,14 @@ func main() {
 
 	log.Println("[main] shutdown initiated, stopping components")
 
-	sigEngine.Stop()
-	_ = execEngine.Stop()
+	execEngine.Stop()
 	coinScanner.Stop()
+	alerter.Stop()
+
+	if paperClient != nil {
+		tradeLog := paperClient.GetTradeLog()
+		log.Printf("[main] paper trading session complete, total trades: %d", len(tradeLog))
+	}
 
 	log.Println("[main] waiting for goroutines to finish")
 
@@ -449,9 +475,9 @@ func main() {
 		log.Println("[main] timeout waiting for goroutines, forcing exit")
 	}
 
-	if err := stateMgr.Save("state.json"); err != nil {
+	if err := stateMgr.SaveState(); err != nil {
 		log.Printf("[main] failed to save state: %v", err)
 	}
 
-	log.Println("[main] Delta Exchange Altcoin Futures Scalping Bot stopped")
+	log.Println("[main] Delta Exchange Altcoin Futures Scalping System stopped")
 }
